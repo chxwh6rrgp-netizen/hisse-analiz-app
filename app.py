@@ -5,10 +5,10 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from datetime import datetime
 
-st.set_page_config(page_title="BIST PRO v2 Hisse Analiz Paneli", layout="wide")
+st.set_page_config(page_title="BIST AI PRO Radar", layout="wide", page_icon="📈")
 
-# Geniş BIST tarama listesi. Yahoo Finance veri vermeyenleri uygulama otomatik pas geçer.
 BIST_WATCHLIST = [
     "AEFES","AGHOL","AKBNK","AKCNS","AKFGY","AKSA","AKSEN","ALARK","ALBRK","ALGYO","ARCLK","ASELS","ASTOR",
     "BAGFS","BERA","BIMAS","BRSAN","BRYAT","BUCIM","CANTE","CCOLA","CIMSA","CLEBI","DOAS","DOHOL","ECILC",
@@ -16,7 +16,9 @@ BIST_WATCHLIST = [
     "IPEKE","ISCTR","ISDMR","ISGYO","ISMEN","IZMDC","KARSN","KCHOL","KONTR","KORDS","KOZAA","KOZAL","KRDMD",
     "LOGO","MAVI","MGROS","ODAS","OYAKC","PETKM","PGSUS","QUAGR","SAHOL","SASA","SISE","SKBNK","SOKM","TAVHL",
     "TCELL","THYAO","TKFEN","TOASO","TSKB","TTKOM","TTRAK","TUPRS","TURSG","ULKER","VAKBN","VESTL","YKBNK",
-    "ZOREN","ALFAS","CWENE","EUPWR","YEOTK","PEKGY","TRGYO","KONYA","NTHOL","PENTA","SELEC","TMSN","VAKKO"
+    "ZOREN","ALFAS","CWENE","EUPWR","YEOTK","PEKGY","TRGYO","KONYA","NTHOL","PENTA","SELEC","TMSN","VAKKO",
+    "AHGAZ","AKFYE","BIENY","BOBET","DAPGM","EUREN","GWIND","KCAER","KLSER","MIATK","REEDR","TABGD","TATEN",
+    "ENERY","MAGEN","SMRTG","KMPUR","GESAN","SDTTR","HTTBT","KAYSE","FORTE","CWENE","IZENR","KZBGY","ULUUN"
 ]
 
 def normalize_symbol(s):
@@ -25,13 +27,18 @@ def normalize_symbol(s):
         s += ".IS"
     return s
 
-@st.cache_data(ttl=900)
-def load_data(symbol, period="2y", interval="1d"):
+def safe_float(x, default=np.nan):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_single(symbol, period="2y", interval="1d"):
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    df = df.dropna()
-    return df
+    return df.dropna()
 
 def rsi(close, n=14):
     delta = close.diff()
@@ -58,230 +65,278 @@ def macd(close):
     hist = line - signal
     return line, signal, hist
 
-def indicators(df):
+def stochastic(df, n=14):
+    low = df["Low"].rolling(n).min()
+    high = df["High"].rolling(n).max()
+    return 100 * (df["Close"] - low) / (high - low).replace(0, np.nan)
+
+def compute_indicators(df):
     df = df.copy()
+    df["SMA10"] = df["Close"].rolling(10).mean()
     df["SMA20"] = df["Close"].rolling(20).mean()
     df["SMA50"] = df["Close"].rolling(50).mean()
     df["SMA100"] = df["Close"].rolling(100).mean()
     df["SMA200"] = df["Close"].rolling(200).mean()
-    df["RSI"] = rsi(df["Close"], 14)
-    df["ATR"] = atr(df, 14)
+    df["RSI"] = rsi(df["Close"])
+    df["ATR"] = atr(df)
     df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = macd(df["Close"])
+    df["STOCH"] = stochastic(df)
     df["VOL_AVG20"] = df["Volume"].rolling(20).mean()
     df["VOL_RATIO"] = df["Volume"] / df["VOL_AVG20"].replace(0, np.nan)
     df["BB_MID"] = df["Close"].rolling(20).mean()
     df["BB_STD"] = df["Close"].rolling(20).std()
     df["BB_UP"] = df["BB_MID"] + 2 * df["BB_STD"]
     df["BB_LOW"] = df["BB_MID"] - 2 * df["BB_STD"]
-    direction = np.sign(df["Close"].diff()).fillna(0)
-    df["OBV"] = (direction * df["Volume"]).cumsum()
+    sign = np.sign(df["Close"].diff()).fillna(0)
+    df["OBV"] = (sign * df["Volume"]).cumsum()
+    df["RET5"] = df["Close"].pct_change(5) * 100
     df["RET20"] = df["Close"].pct_change(20) * 100
     df["RET60"] = df["Close"].pct_change(60) * 100
+    df["HIGH20"] = df["High"].rolling(20).max()
+    df["LOW20"] = df["Low"].rolling(20).min()
+    df["HIGH60"] = df["High"].rolling(60).max()
+    df["LOW60"] = df["Low"].rolling(60).min()
     return df.dropna()
 
-def support_resistance(df, lookback=120):
-    d = df.tail(lookback)
-    support = float(d["Low"].rolling(5).min().dropna().quantile(0.22))
-    resistance = float(d["High"].rolling(5).max().dropna().quantile(0.78))
-    major_low = float(d["Low"].min())
-    major_high = float(d["High"].max())
-    return support, resistance, major_low, major_high
-
 def pct(a, b):
-    if b == 0 or pd.isna(b):
+    if b == 0 or pd.isna(a) or pd.isna(b):
         return np.nan
     return (a / b - 1) * 100
 
-def score_and_context(df):
+def support_resistance(df, lookback=120):
+    d = df.tail(lookback)
+    swing_low = d["Low"].rolling(5).min().dropna()
+    swing_high = d["High"].rolling(5).max().dropna()
+    support = safe_float(swing_low.quantile(0.22), safe_float(d["Low"].min()))
+    resistance = safe_float(swing_high.quantile(0.78), safe_float(d["High"].max()))
+    major_low = safe_float(d["Low"].min())
+    major_high = safe_float(d["High"].max())
+    return support, resistance, major_low, major_high
+
+def pattern_detection(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    price = float(last["Close"])
+    price = last["Close"]
+    patterns = []
+    if price > last["HIGH20"] * 0.995 and last["VOL_RATIO"] > 1.2:
+        patterns.append("20 günlük zirve kırılımı ve hacim teyidi")
+    if last["RSI"] < 45 and last["MACD_HIST"] > prev["MACD_HIST"] and price > last["SMA10"]:
+        patterns.append("dipten dönüş denemesi")
+    if price > last["SMA20"] and prev["Close"] <= prev["SMA20"] and last["VOL_RATIO"] > 1.0:
+        patterns.append("20 günlük ortalama üstüne hacimli dönüş")
+    if last["BB_LOW"] * 0.98 <= price <= last["BB_LOW"] * 1.05 and last["RSI"] < 45:
+        patterns.append("Bollinger alt bant tepki bölgesi")
+    if price > last["SMA50"] and last["SMA20"] > last["SMA50"] and last["MACD"] > last["MACD_SIGNAL"]:
+        patterns.append("trend devam formasyonu")
+    return patterns
+
+def professional_score(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    price = safe_float(last["Close"])
+    atrv = max(safe_float(last["ATR"]), 0.01)
     support, resistance, major_low, major_high = support_resistance(df)
-    atrv = float(last["ATR"])
-    dist_support = pct(price, support)
-    dist_resistance = pct(resistance, price)
-    trend_score = 0
-    momentum_score = 0
-    volume_score = 0
-    risk_score = 0
+    dist_sup = pct(price, support)
+    dist_res = pct(resistance, price)
+    potential = max(dist_res, pct(price + 2.2 * atrv, price))
+    stop = min(support * 0.985, price - 1.4 * atrv)
+    target1 = max(resistance, price + 2.0 * atrv)
+    target2 = price + 3.3 * atrv
+    risk = max(price - stop, 0.01)
+    reward = max(target1 - price, 0)
+    rr = reward / risk if risk else np.nan
 
-    # Trend değerlendirmesi
+    # 5 ana modül: trend, momentum, para girişi, alım bölgesi, risk/ödül
+    trend = 0
     if price > last["SMA20"] > last["SMA50"] > last["SMA100"]:
-        trend_score = 28
-        trend_state = "güçlü yükselen trend"
+        trend = 24
+        trend_label = "Ana trend güçlü; fiyat kısa ve orta vadeli ortalamaların üzerinde."
     elif price > last["SMA20"] > last["SMA50"]:
-        trend_score = 22
-        trend_state = "pozitif kısa vadeli trend"
+        trend = 20
+        trend_label = "Kısa vadeli trend pozitif; 20 ve 50 günlük ortalamalar destek konumunda."
     elif price > last["SMA50"]:
-        trend_score = 15
-        trend_state = "orta vadede toparlanma eğilimi"
+        trend = 14
+        trend_label = "Orta vadede toparlanma var fakat trend tam güçlenmiş değil."
     elif price > last["SMA20"]:
-        trend_score = 10
-        trend_state = "kısa vadeli tepki denemesi"
+        trend = 9
+        trend_label = "Kısa vadeli tepki var ama ana trend zayıf."
     else:
-        trend_score = 4
-        trend_state = "zayıf trend"
+        trend = 3
+        trend_label = "Fiyat önemli ortalamaların altında; trend zayıf."
 
-    # Momentum
-    r = float(last["RSI"])
-    macd_positive = last["MACD"] > last["MACD_SIGNAL"]
-    macd_improving = last["MACD_HIST"] > prev["MACD_HIST"]
-    if 50 <= r <= 65 and macd_positive and macd_improving:
-        momentum_score = 28
-        momentum_state = "sağlıklı ve güçlenen momentum"
-    elif 45 <= r < 70 and macd_positive:
-        momentum_score = 22
-        momentum_state = "pozitif momentum"
-    elif 35 <= r < 45 and macd_improving:
-        momentum_score = 16
-        momentum_state = "dipten toparlanma denemesi"
+    momentum = 0
+    r = safe_float(last["RSI"])
+    macd_pos = last["MACD"] > last["MACD_SIGNAL"]
+    macd_turn = last["MACD_HIST"] > prev["MACD_HIST"]
+    stoch = safe_float(last["STOCH"])
+    if 50 <= r <= 65 and macd_pos and macd_turn:
+        momentum = 24
+        momentum_label = "Momentum sağlıklı; RSI aşırı alımda değil ve MACD güçleniyor."
+    elif 45 <= r < 70 and macd_pos:
+        momentum = 19
+        momentum_label = "Momentum pozitif fakat güç teyidi için hacim/direnç takibi gerekir."
+    elif 32 <= r < 45 and macd_turn and stoch < 55:
+        momentum = 16
+        momentum_label = "Dipten dönüş ihtimali var; erken sinyal oluşuyor."
     elif r >= 70:
-        momentum_score = 8
-        momentum_state = "aşırı alıma yaklaşmış momentum"
+        momentum = 6
+        momentum_label = "RSI aşırı alım bölgesine yakın; yeni alımda kâr satışı riski yüksek."
     else:
-        momentum_score = 6
-        momentum_state = "zayıf veya kararsız momentum"
+        momentum = 5
+        momentum_label = "Momentum net değil; alım için yeterli teyit yok."
 
-    # Hacim / para girişi
-    vol_ratio = float(last["VOL_RATIO"]) if not pd.isna(last["VOL_RATIO"]) else 0
-    obv_up_20 = df["OBV"].iloc[-1] > df["OBV"].iloc[-20]
-    obv_up_60 = df["OBV"].iloc[-1] > df["OBV"].iloc[-60]
-    if vol_ratio >= 1.6 and obv_up_20:
-        volume_score = 22
-        volume_state = "hacim destekli para girişi işareti"
-    elif vol_ratio >= 1.1 and obv_up_20:
-        volume_score = 16
-        volume_state = "ılımlı hacim desteği"
-    elif obv_up_60:
-        volume_score = 10
-        volume_state = "uzun vadeli OBV toparlanması"
+    vol = safe_float(last["VOL_RATIO"], 0)
+    obv20 = df["OBV"].iloc[-1] > df["OBV"].iloc[-20]
+    obv60 = df["OBV"].iloc[-1] > df["OBV"].iloc[-60]
+    money = 0
+    if vol >= 1.7 and obv20:
+        money = 22
+        money_label = "Hacim ve OBV birlikte güçlü para girişine işaret ediyor."
+    elif vol >= 1.2 and obv20:
+        money = 17
+        money_label = "Hacim destekli alıcı ilgisi var."
+    elif obv60 and vol >= 0.9:
+        money = 11
+        money_label = "OBV uzun vadede toparlanıyor; para girişi ılımlı."
     else:
-        volume_score = 4
-        volume_state = "hacim desteği zayıf"
+        money = 4
+        money_label = "Hacim/OBV tarafında güçlü alıcı izi yok."
 
-    # Risk/ödül
-    stop = min(support * 0.985, price - 1.35 * atrv)
-    target1 = max(resistance, price + 1.8 * atrv)
-    target2 = price + 3.0 * atrv
-    downside = max(price - stop, 0.01)
-    upside = target1 - price
-    rr = upside / downside if downside > 0 else np.nan
-    potential = pct(target1, price)
-    stop_loss_pct = pct(stop, price)
+    zone = 0
+    if dist_sup <= 4 and potential >= 7 and r < 68:
+        zone = 18
+        zone_label = "Fiyat desteğe yakın ve yukarı hedef alanı açık; alım bölgesi mantıklı."
+    elif dist_sup <= 8 and potential >= 5:
+        zone = 13
+        zone_label = "Fiyat destekten çok uzak değil; kademeli takip edilebilir."
+    elif dist_res <= 3:
+        zone = 3
+        zone_label = "Fiyat dirence yakın; yeni alım için güvenlik marjı dar."
+    else:
+        zone = 7
+        zone_label = "Alım bölgesi net değil; daha iyi fiyat veya teyit beklenebilir."
 
-    if potential >= 8 and rr >= 1.4 and dist_support <= 8:
-        risk_score = 22
-        risk_state = "risk/ödül dengesi olumlu"
-    elif potential >= 5 and rr >= 1.1:
-        risk_score = 15
-        risk_state = "risk/ödül dengesi izlenebilir"
-    elif dist_resistance < 3:
+    risk_score = 0
+    if rr >= 1.6 and potential >= 8 and abs(pct(stop, price)) <= 8:
+        risk_score = 18
+        risk_label = "Risk/ödül cazip; stop mesafesi yönetilebilir."
+    elif rr >= 1.15 and potential >= 5:
+        risk_score = 12
+        risk_label = "Risk/ödül izlenebilir ama kusursuz değil."
+    elif abs(pct(stop, price)) > 10:
+        risk_score = 4
+        risk_label = "Stop mesafesi geniş; pozisyon riski yüksek."
+    else:
         risk_score = 5
-        risk_state = "dirence çok yakın, marj dar"
+        risk_label = "Risk/ödül zayıf; hedefe göre risk fazla."
+
+    total = int(min(100, trend + momentum + money + zone + risk_score))
+    patterns = pattern_detection(df)
+
+    # Profesyonel fırsat filtresi
+    block_reasons = []
+    if r >= 72: block_reasons.append("RSI aşırı alım bölgesinde")
+    if dist_res <= 2.5: block_reasons.append("dirence çok yakın")
+    if rr < 1.05: block_reasons.append("risk/ödül yetersiz")
+    if potential < 5: block_reasons.append("hedef potansiyeli düşük")
+    if vol < 0.75 and not obv20: block_reasons.append("hacim teyidi yok")
+
+    real_opportunity = total >= 68 and len(block_reasons) == 0 and (macd_pos or macd_turn)
+
+    if total >= 82 and real_opportunity:
+        decision = "🔥 AI GÜÇLÜ FIRSAT"
+        action = "Aday"
+    elif total >= 68 and real_opportunity:
+        decision = "🟢 AI ALIM BÖLGESİ"
+        action = "Aday"
+    elif total >= 55:
+        decision = "🟡 AI TAKİP"
+        action = "Bekle"
     else:
-        risk_score = 8
-        risk_state = "risk/ödül net güçlü değil"
-
-    total = int(min(100, trend_score + momentum_score + volume_score + risk_score))
-
-    # Fırsat filtresi: her yüksek skora fırsat denmez
-    real_opportunity = (
-        total >= 65 and
-        potential >= 5 and
-        rr >= 1.05 and
-        r < 72 and
-        (macd_positive or macd_improving) and
-        dist_resistance > 2
-    )
-
-    if total >= 80 and real_opportunity:
-        decision = "🔥 GÜÇLÜ FIRSAT"
-    elif total >= 65 and real_opportunity:
-        decision = "🟢 ALIM BÖLGESİ / POZİTİF"
-    elif total >= 50:
-        decision = "🟡 TAKİP"
-    else:
-        decision = "🔴 ZAYIF / UZAK DUR"
+        decision = "🔴 AI RİSKLİ / ZAYIF"
+        action = "Uzak Dur"
 
     return {
-        "score": total, "decision": decision,
-        "trend_state": trend_state, "momentum_state": momentum_state, "volume_state": volume_state, "risk_state": risk_state,
+        "price": price, "score": total, "decision": decision, "action": action,
+        "trend": trend, "momentum": momentum, "money": money, "zone": zone, "risk_score": risk_score,
+        "trend_label": trend_label, "momentum_label": momentum_label, "money_label": money_label,
+        "zone_label": zone_label, "risk_label": risk_label,
         "support": support, "resistance": resistance, "major_low": major_low, "major_high": major_high,
-        "stop": stop, "target1": target1, "target2": target2, "rr": rr, "potential": potential, "stop_loss_pct": stop_loss_pct,
-        "dist_support": dist_support, "dist_resistance": dist_resistance,
-        "real_opportunity": real_opportunity
+        "stop": stop, "target1": target1, "target2": target2, "rr": rr, "potential": pct(target1, price),
+        "stop_pct": pct(stop, price), "dist_sup": dist_sup, "dist_res": dist_res,
+        "rsi": r, "macd_pos": macd_pos, "macd_turn": macd_turn, "vol_ratio": vol,
+        "patterns": patterns, "block_reasons": block_reasons, "real_opportunity": real_opportunity,
+        "ret5": safe_float(last["RET5"],0), "ret20": safe_float(last["RET20"],0), "ret60": safe_float(last["RET60"],0),
     }
 
-def human_comment(symbol, df, ctx):
-    last = df.iloc[-1]
-    price = float(last["Close"])
-    r = float(last["RSI"])
-    vol = float(last["VOL_RATIO"]) if not pd.isna(last["VOL_RATIO"]) else 0
-    macd_positive = last["MACD"] > last["MACD_SIGNAL"]
-    macd_improving = last["MACD_HIST"] > df["MACD_HIST"].iloc[-2]
-    ret20 = float(last["RET20"]) if not pd.isna(last["RET20"]) else 0
-    ret60 = float(last["RET60"]) if not pd.isna(last["RET60"]) else 0
+def ai_commentary(symbol, df, ctx):
+    price = ctx["price"]
+    lines = []
 
-    # Trend yorumu
-    if price > last["SMA20"] > last["SMA50"]:
-        trend_text = f"{symbol} tarafında fiyat kısa vadeli ortalamaların üzerinde kaldığı için ana görüntü pozitif. Son 20 günlük performans yaklaşık %{ret20:.1f}; bu, hissenin son dönemde piyasadan ilgi gördüğünü gösterir."
-    elif price > last["SMA50"]:
-        trend_text = f"{symbol} 50 günlük ortalamanın üzerinde tutunuyor fakat kısa vadeli yapı tam anlamıyla güçlü değil. Bu görünüm genelde 'toparlanma var ama teyit gerekiyor' şeklinde okunur."
-    elif price < last["SMA20"] and price < last["SMA50"]:
-        trend_text = f"{symbol} şu anda hem kısa hem orta vadeli ortalamaların altında. Bu nedenle trend tarafında acele alım yerine dönüş teyidi beklemek daha sağlıklı olur."
+    if ctx["real_opportunity"]:
+        opener = f"{symbol} şu an teknik olarak izlenebilir bir fırsat adayı. Bunun sebebi tek bir indikatör değil; trend, momentum, hacim ve risk/ödül tarafının aynı anda kabul edilebilir seviyede olması."
+    elif ctx["action"] == "Bekle":
+        opener = f"{symbol} için görüntü tamamen kötü değil fakat alım kararı için eksik teyitler var. Bu hisseyi acele almak yerine belirlenen seviyeler etrafında takip etmek daha mantıklı."
     else:
-        trend_text = f"{symbol} tarafında trend karışık. Fiyat bazı ortalamaların üzerinde olsa da net bir yukarı trend görüntüsü henüz oluşmamış."
+        opener = f"{symbol} şu an riskli bölgede. Teknik yapı yeterince desteklenmediği için alım tarafında acele etmek doğru görünmüyor."
+    lines.append(opener)
 
-    # Momentum yorumu
-    if 50 <= r <= 65 and macd_positive:
-        momentum_text = f"RSI {r:.1f} seviyesinde; bu bölge aşırı alım olmadan pozitif momentum anlamına gelir. MACD de pozitif olduğu için teknik görünüm destekleniyor."
-    elif r > 70:
-        momentum_text = f"RSI {r:.1f} ile aşırı alım bölgesine yaklaşmış. Hisse güçlü olabilir fakat bu seviyelerde kısa vadeli kâr satışı riski artar."
-    elif 35 <= r < 45 and macd_improving:
-        momentum_text = f"RSI {r:.1f} ile düşük bölgede ve MACD histogramı toparlanıyor. Bu yapı dipten dönüş denemesi olarak izlenebilir, ancak teyit için hacim önemlidir."
+    # Neden
+    lines.append(f"Trend okuması: {ctx['trend_label']}")
+    lines.append(f"Momentum okuması: {ctx['momentum_label']}")
+    lines.append(f"Para girişi okuması: {ctx['money_label']}")
+    lines.append(f"Alım bölgesi okuması: {ctx['zone_label']}")
+    lines.append(f"Risk okuması: {ctx['risk_label']}")
+
+    if ctx["patterns"]:
+        lines.append("Yakalanan teknik yapı: " + ", ".join(ctx["patterns"]) + ".")
     else:
-        momentum_text = f"RSI {r:.1f} ve MACD birlikte çok net bir güç sinyali üretmiyor. Momentum tarafında seçici olmak gerekir."
+        lines.append("Belirgin bir kırılım/dip dönüş formasyonu henüz netleşmemiş.")
 
-    # Hacim yorumu
-    if vol >= 1.6:
-        volume_text = f"Hacim son 20 günlük ortalamanın {vol:.2f} katı. Bu durum hareketin sıradan olmadığını, piyasada belirgin ilgi oluştuğunu gösterir."
-    elif vol >= 1.0:
-        volume_text = f"Hacim ortalamanın biraz üzerinde ({vol:.2f}x). Hareket destekleniyor ama çok güçlü para girişi demek için daha yüksek hacim görmek iyi olur."
-    else:
-        volume_text = f"Hacim ortalamanın altında ({vol:.2f}x). Bu nedenle yükseliş varsa bile hacimle teyit edilmediği için temkinli okunmalı."
+    # Senaryo
+    bull = f"Olumlu senaryo: fiyat {ctx['resistance']:.2f} direncini hacimle geçerse ilk hedef {ctx['target1']:.2f}, devamında {ctx['target2']:.2f} bölgesi izlenebilir."
+    bear = f"Olumsuz senaryo: fiyat {ctx['support']:.2f} desteğini kaybederse görünüm bozulur; risk azaltma seviyesi {ctx['stop']:.2f} civarıdır."
+    lines.append(bull)
+    lines.append(bear)
 
-    # Destek/direnç ve hedef yorumu
-    if ctx["dist_support"] <= 4 and ctx["potential"] >= 6:
-        zone_text = f"Fiyat desteğe yakın ve hedef potansiyeli %{ctx['potential']:.1f}. Bu yüzden teknik olarak alım bölgesine yakın sayılabilir."
-    elif ctx["dist_resistance"] <= 3:
-        zone_text = f"Fiyat dirence çok yakın. Hedef alanı daraldığı için yeni alımda risk/ödül cazibesi zayıflıyor."
-    elif ctx["potential"] >= 8 and ctx["rr"] >= 1.3:
-        zone_text = f"Hedef alanı geniş: ilk hedefe potansiyel yaklaşık %{ctx['potential']:.1f}, risk/ödül oranı {ctx['rr']:.2f}. Bu teknik açıdan izlenebilir bir fırsat yapısıdır."
-    else:
-        zone_text = f"Destek-direnç mesafesi çok ideal değil. İlk hedef potansiyeli %{ctx['potential']:.1f}, risk/ödül oranı {ctx['rr']:.2f}; bu nedenle aceleci olmamak gerekir."
+    if ctx["block_reasons"]:
+        lines.append("Fırsat filtresini zayıflatan noktalar: " + ", ".join(ctx["block_reasons"]) + ".")
 
-    # Sonuç
-    if "GÜÇLÜ FIRSAT" in ctx["decision"]:
-        final_text = "Genel sonuç: hisse teknik olarak güçlü fırsat bölgesinde görünüyor; yine de stop seviyesi mutlaka izlenmeli."
-    elif "ALIM BÖLGESİ" in ctx["decision"]:
-        final_text = "Genel sonuç: teknik görünüm pozitif. Alım için makul bölge oluşmuş olabilir fakat hacim ve destek korunumu takip edilmeli."
+    # İnsan gibi karar cümlesi
+    if "GÜÇLÜ" in ctx["decision"]:
+        final = "Sonuç: Bu hisse 'hemen her fiyattan alınır' demek değildir; ama teknik sistem açısından güçlü adaylardan biridir. En mantıklı yaklaşım destek/stop planıyla kontrollü pozisyon olur."
+    elif "ALIM" in ctx["decision"]:
+        final = "Sonuç: Pozitif aday. Tam güçlenme için hacim ve direnç kırılımı takip edilmeli; stop seviyesi belirlenmeden işlem açılmamalı."
     elif "TAKİP" in ctx["decision"]:
-        final_text = "Genel sonuç: hisse izlemeye değer, fakat şu an net alım sinyali yeterince güçlü değil."
+        final = "Sonuç: İzleme listesinde kalmalı. Alım için ya desteğe yaklaşmasını ya da direnç üstü hacimli kapanış yapmasını beklemek daha sağlıklı."
     else:
-        final_text = "Genel sonuç: teknik yapı zayıf. Daha net dönüş veya hacim teyidi gelmeden riskli görünüyor."
+        final = "Sonuç: Şu an para kazanma ihtimali kadar zarar riski de belirgin. Daha kaliteli fırsatlar varken öncelik verilmemeli."
+    lines.append(final)
+    return lines
 
-    return [trend_text, momentum_text, volume_text, zone_text, final_text]
+def analyze(symbol, period="2y", interval="1d"):
+    df = load_single(symbol, period, interval)
+    if df.empty or len(df) < 230:
+        return None
+    df = compute_indicators(df)
+    if df.empty or len(df) < 80:
+        return None
+    ctx = professional_score(df)
+    comments = ai_commentary(symbol.replace(".IS",""), df, ctx)
+    return {"symbol": symbol, "df": df, "ctx": ctx, "comments": comments}
 
 def plot_chart(df, symbol, ctx):
     fig = make_subplots(
         rows=4, cols=1, shared_xaxes=True,
-        row_heights=[0.52, 0.16, 0.16, 0.16],
-        vertical_spacing=0.03,
-        subplot_titles=("Fiyat / Trend", "Hacim", "RSI", "MACD")
+        row_heights=[0.50, 0.16, 0.17, 0.17],
+        vertical_spacing=0.035,
+        subplot_titles=("Fiyat, Ortalamalar, Hedef/Stop", "Hacim", "RSI", "MACD")
     )
     fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Mum"), row=1, col=1)
-    for col in ["SMA20","SMA50","SMA100","SMA200","BB_UP","BB_LOW"]:
+    for col in ["SMA20","SMA50","SMA100","SMA200"]:
         fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=col), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_UP"], mode="lines", name="BB Üst", opacity=0.35), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_LOW"], mode="lines", name="BB Alt", opacity=0.35), row=1, col=1)
     fig.add_hline(y=ctx["support"], line_dash="dot", annotation_text="Destek", row=1, col=1)
     fig.add_hline(y=ctx["resistance"], line_dash="dot", annotation_text="Direnç", row=1, col=1)
     fig.add_hline(y=ctx["target1"], line_dash="dash", annotation_text="Hedef 1", row=1, col=1)
@@ -289,86 +344,81 @@ def plot_chart(df, symbol, ctx):
     fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Hacim"), row=2, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], mode="lines", name="RSI"), row=3, col=1)
     fig.add_hline(y=70, row=3, col=1)
+    fig.add_hline(y=50, row=3, col=1)
     fig.add_hline(y=30, row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], mode="lines", name="MACD"), row=4, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MACD_SIGNAL"], mode="lines", name="Signal"), row=4, col=1)
     fig.add_trace(go.Bar(x=df.index, y=df["MACD_HIST"], name="Hist"), row=4, col=1)
-    fig.update_layout(height=880, xaxis_rangeslider_visible=False, title=f"{symbol} PRO v2 Teknik Grafik", template="plotly_white")
+    fig.update_layout(height=900, xaxis_rangeslider_visible=False, template="plotly_white", title=f"{symbol} AI PRO Grafik")
     return fig
 
-def analyze(symbol, period, interval):
-    df = load_data(symbol, period, interval)
-    if df.empty or len(df) < 220:
-        return None
-    df = indicators(df)
-    if df.empty or len(df) < 30:
-        return None
-    ctx = score_and_context(df)
-    last = df.iloc[-1]
-    comments = human_comment(symbol.replace(".IS",""), df, ctx)
-    return {
-        "symbol": symbol, "df": df, "ctx": ctx, "comments": comments,
-        "price": float(last["Close"]), "rsi": float(last["RSI"]), "macd": float(last["MACD"]),
-        "atr": float(last["ATR"]), "vol_ratio": float(last["VOL_RATIO"]) if not pd.isna(last["VOL_RATIO"]) else 0
-    }
+def score_bar(ctx):
+    data = pd.DataFrame({
+        "Modül": ["Trend", "Momentum", "Para Girişi", "Alım Bölgesi", "Risk/Ödül"],
+        "Puan": [ctx["trend"], ctx["momentum"], ctx["money"], ctx["zone"], ctx["risk_score"]]
+    })
+    fig = go.Figure(go.Bar(x=data["Modül"], y=data["Puan"]))
+    fig.update_layout(height=300, template="plotly_white", yaxis_title="Puan")
+    return fig
 
-st.sidebar.title("Ayarlar")
-mode = st.sidebar.radio("Mod", ["Tek Hisse Analizi", "BIST Fırsat Tarayıcı"])
+st.sidebar.title("📌 Panel")
+mode = st.sidebar.radio("Mod", ["Tek Hisse AI Analiz", "BIST AI Radar", "Portföy / İzleme"])
 period = st.sidebar.selectbox("Veri dönemi", ["1y","2y","5y"], index=1)
 interval = st.sidebar.selectbox("Periyot", ["1d","1wk"], index=0)
+st.sidebar.caption("Not: Veri Yahoo Finance üzerinden gelir. Bazı BIST hisselerinde veri gecikmeli/eksik olabilir.")
 
-st.title("📈 BIST PRO v2 Hisse Analiz Paneli")
-st.caption("Daha anlaşılır yorum, gerçek fırsat filtresi, geniş BIST tarama, hedef/stop ve risk/ödül analizi.")
-st.warning("Bu uygulama yatırım tavsiyesi vermez. Sonuçlar teknik göstergelere dayalı otomatik analizdir.")
+st.title("📈 BIST AI PRO Radar")
+st.caption("Hızlı tarama + dashboard + insan gibi teknik yorum + fırsat/risk ayrımı.")
+st.warning("Bu uygulama yatırım tavsiyesi değildir. Karar destek aracıdır. Stop, risk ve pozisyon büyüklüğü kullanıcı sorumluluğundadır.")
 
-if mode == "Tek Hisse Analizi":
-    raw = st.sidebar.text_input("Hisse / Sembol", "THYAO")
+if mode == "Tek Hisse AI Analiz":
+    raw = st.sidebar.text_input("Hisse", "THYAO")
     symbol = normalize_symbol(raw)
-    res = analyze(symbol, period, interval)
+    with st.spinner(f"{symbol} analiz ediliyor..."):
+        res = analyze(symbol, period, interval)
     if res is None:
-        st.error("Veri alınamadı veya veri yetersiz. Örn: THYAO, TUPRS, PEKGY")
+        st.error("Veri alınamadı veya veri yetersiz. Sembolü kontrol et. Örn: THYAO, TUPRS, ASELS")
         st.stop()
 
-    ctx = res["ctx"]
-    c1,c2,c3,c4,c5,c6 = st.columns(6)
-    c1.metric("Son Fiyat", f"{res['price']:.2f}")
-    c2.metric("PRO Skor", f"{ctx['score']}/100")
-    c3.metric("RSI 14", f"{res['rsi']:.1f}")
-    c4.metric("MACD", f"{res['macd']:.2f}")
-    c5.metric("ATR 14", f"{res['atr']:.2f}")
-    c6.metric("Hacim / Ort.", f"{res['vol_ratio']:.2f}x")
+    df, ctx = res["df"], res["ctx"]
+    m1,m2,m3,m4,m5,m6 = st.columns(6)
+    m1.metric("Fiyat", f"{ctx['price']:.2f}")
+    m2.metric("AI Skor", f"{ctx['score']}/100")
+    m3.metric("Karar", ctx["action"])
+    m4.metric("Hedef 1", f"{ctx['target1']:.2f}", f"%{ctx['potential']:.1f}")
+    m5.metric("Stop", f"{ctx['stop']:.2f}", f"%{ctx['stop_pct']:.1f}")
+    m6.metric("Risk/Ödül", f"{ctx['rr']:.2f}")
 
     st.subheader(ctx["decision"])
+    tab1, tab2, tab3 = st.tabs(["AI Yorum", "Grafik", "Skor Detayı"])
 
-    colA, colB, colC, colD, colE = st.columns(5)
-    colA.metric("Destek", f"{ctx['support']:.2f}")
-    colB.metric("Direnç", f"{ctx['resistance']:.2f}")
-    colC.metric("Hedef 1", f"{ctx['target1']:.2f}", f"%{ctx['potential']:.1f}")
-    colD.metric("Stop", f"{ctx['stop']:.2f}", f"%{ctx['stop_loss_pct']:.1f}")
-    colE.metric("Risk/Ödül", f"{ctx['rr']:.2f}")
+    with tab1:
+        for line in res["comments"]:
+            st.write(line)
+        st.info(f"Destek: {ctx['support']:.2f} | Direnç: {ctx['resistance']:.2f} | RSI: {ctx['rsi']:.1f} | Hacim/Ort: {ctx['vol_ratio']:.2f}x")
+    with tab2:
+        st.plotly_chart(plot_chart(df, symbol, ctx), use_container_width=True)
+    with tab3:
+        st.plotly_chart(score_bar(ctx), use_container_width=True)
+        st.write("Fırsat filtresini bloke eden sebepler:", ctx["block_reasons"] if ctx["block_reasons"] else "Yok")
+        st.write("Yakalanan teknik yapılar:", ctx["patterns"] if ctx["patterns"] else "Net yapı yok")
 
-    st.plotly_chart(plot_chart(res["df"], symbol, ctx), use_container_width=True)
+elif mode == "BIST AI Radar":
+    st.subheader("🚀 BIST AI Radar")
+    st.caption("Geniş BIST listesini tarar. Önce gerçekten fırsat filtresinden geçenleri öne çıkarır.")
+    preset = st.selectbox("Liste", ["Geniş BIST Listesi", "Kendi listem"])
+    if preset == "Kendi listem":
+        raw_list = st.text_area("Hisseleri virgülle yaz", "THYAO,TUPRS,ASELS,EREGL,KCHOL", height=120)
+        symbols = [normalize_symbol(x) for x in raw_list.split(",") if x.strip()]
+    else:
+        symbols = [normalize_symbol(x) for x in BIST_WATCHLIST]
 
-    st.subheader("Düşünülmüş Teknik Yorum")
-    for p in res["comments"]:
-        st.write(p)
+    colf1, colf2, colf3 = st.columns(3)
+    min_score = colf1.slider("Minimum AI skor", 0, 100, 60)
+    only_candidates = colf2.checkbox("Sadece adayları göster", value=True)
+    min_potential = colf3.slider("Minimum hedef potansiyeli %", 0, 30, 5)
 
-    with st.expander("Skorun nasıl oluştuğunu göster"):
-        st.write(f"Trend: {ctx['trend_state']}")
-        st.write(f"Momentum: {ctx['momentum_state']}")
-        st.write(f"Hacim / OBV: {ctx['volume_state']}")
-        st.write(f"Risk/Ödül: {ctx['risk_state']}")
-        st.write(f"Desteğe uzaklık: %{ctx['dist_support']:.1f}")
-        st.write(f"Dirence uzaklık: %{ctx['dist_resistance']:.1f}")
-
-else:
-    st.subheader("🔎 Geniş BIST Fırsat Tarayıcı")
-    st.caption("Tüm listeyi tarar; veri gelmeyen hisseleri pas geçer. Sonuçlar fırsat filtresine göre sıralanır.")
-    custom = st.text_area("Taranacak hisseler", ",".join(BIST_WATCHLIST), height=160)
-    symbols = [normalize_symbol(x.strip()) for x in custom.split(",") if x.strip()]
-    only_opps = st.checkbox("Sadece gerçek fırsat filtresinden geçenleri göster", value=True)
-
-    if st.button("Tüm Listeyi Tara"):
+    if st.button("AI Radar Taramasını Başlat"):
         rows = []
         prog = st.progress(0)
         status = st.empty()
@@ -378,28 +428,67 @@ else:
                 r = analyze(sym, period, interval)
                 if r:
                     ctx = r["ctx"]
-                    if (not only_opps) or ctx["real_opportunity"]:
+                    keep = ctx["score"] >= min_score and ctx["potential"] >= min_potential
+                    if only_candidates:
+                        keep = keep and ctx["real_opportunity"]
+                    if keep:
                         rows.append({
                             "Hisse": sym.replace(".IS",""),
                             "Karar": ctx["decision"],
+                            "Aksiyon": ctx["action"],
                             "Skor": ctx["score"],
-                            "Fiyat": round(r["price"],2),
+                            "Fiyat": round(ctx["price"],2),
                             "Hedef1": round(ctx["target1"],2),
                             "Potansiyel %": round(ctx["potential"],1),
                             "Stop": round(ctx["stop"],2),
-                            "Stop %": round(ctx["stop_loss_pct"],1),
-                            "RSI": round(r["rsi"],1),
-                            "Hacim/Ort": round(r["vol_ratio"],2),
+                            "Stop %": round(ctx["stop_pct"],1),
                             "Risk/Ödül": round(ctx["rr"],2),
-                            "Kısa Yorum": r["comments"][-1]
+                            "RSI": round(ctx["rsi"],1),
+                            "Hacim/Ort": round(ctx["vol_ratio"],2),
+                            "Trend": ctx["trend"],
+                            "Momentum": ctx["momentum"],
+                            "Para": ctx["money"],
+                            "Kısa AI Yorum": r["comments"][0]
                         })
             except Exception:
                 pass
             prog.progress((i+1)/len(symbols))
         status.write("Tarama tamamlandı.")
-        if rows:
-            out = pd.DataFrame(rows).sort_values(["Skor","Risk/Ödül","Potansiyel %"], ascending=False)
-            st.dataframe(out, use_container_width=True)
-            st.download_button("Sonuçları CSV indir", out.to_csv(index=False).encode("utf-8-sig"), "bist_pro_v2_firsatlar.csv", "text/csv")
+        if not rows:
+            st.info("Bu filtrelere göre aday çıkmadı. Minimum skor/potansiyeli düşür veya 'sadece aday' filtresini kapat.")
         else:
-            st.info("Bu filtrelere göre fırsat bulunamadı. 'Sadece gerçek fırsat' filtresini kaldırıp tekrar deneyebilirsin.")
+            out = pd.DataFrame(rows).sort_values(["Skor","Risk/Ödül","Potansiyel %"], ascending=False)
+            st.success(f"{len(out)} adet aday bulundu.")
+            k1,k2,k3,k4 = st.columns(4)
+            k1.metric("En yüksek skor", int(out["Skor"].max()))
+            k2.metric("Ortalama potansiyel", f"%{out['Potansiyel %'].mean():.1f}")
+            k3.metric("En iyi R/R", f"{out['Risk/Ödül'].max():.2f}")
+            k4.metric("Aday sayısı", len(out))
+            st.dataframe(out, use_container_width=True, height=520)
+            st.download_button("Radar sonucunu indir", out.to_csv(index=False).encode("utf-8-sig"), "bist_ai_radar.csv", "text/csv")
+
+else:
+    st.subheader("📒 Portföy / İzleme")
+    st.caption("Kendi hisselerini yaz; uygulama hepsini tek tabloda yorumlasın.")
+    raw_list = st.text_area("İzleme listen", "THYAO,TUPRS,ASELS,EREGL,KCHOL,PEKGY", height=120)
+    symbols = [normalize_symbol(x) for x in raw_list.split(",") if x.strip()]
+    if st.button("İzleme Listemi Analiz Et"):
+        rows = []
+        for sym in symbols:
+            r = analyze(sym, period, interval)
+            if r:
+                ctx = r["ctx"]
+                rows.append({
+                    "Hisse": sym.replace(".IS",""),
+                    "Karar": ctx["decision"],
+                    "Skor": ctx["score"],
+                    "Fiyat": round(ctx["price"],2),
+                    "Hedef1": round(ctx["target1"],2),
+                    "Stop": round(ctx["stop"],2),
+                    "Risk/Ödül": round(ctx["rr"],2),
+                    "AI Özet": r["comments"][-1]
+                })
+        if rows:
+            st.dataframe(pd.DataFrame(rows).sort_values("Skor", ascending=False), use_container_width=True)
+        else:
+            st.info("Veri alınamadı.")
